@@ -1,0 +1,8 @@
+{
+  "name": "hotel-garou-relais",
+  "version": "1.0.0",
+  "description": "Le relais de L'Hôtel Garou : il relie les téléphones d'une même partie.",
+  "main": "serveur.js",
+  "scripts": { "start": "node serveur.js" },
+  "engines": { "node": ">=18" }
+}
