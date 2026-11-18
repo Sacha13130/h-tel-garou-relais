@@ -2,14 +2,22 @@
 // Il fait passer les messages entre l'hôte et les joueurs d'une même salle (un code à 4 chiffres).
 // Lancer : node serveur.js   (le port vient de la variable PORT, sinon 10000)
 //
-// Messages envoyés aux téléphones : [0, id] bienvenue · [1, de, ...] données · [2, id] arrivée · [3, id] départ · [9, texte] erreur
+// Messages envoyés aux téléphones : [0, id] bienvenue · [1, de, ...] données · [2, id] arrivée · [3, id] départ
+//                                   [7] coucou (toutes les 25 s) · [8] au revoir (le relais te coupe) · [9, texte] erreur
 // Messages reçus des téléphones   : [1, pour, ...] données (pour 0 = tout le monde, pour < 0 = tous sauf -pour) · [4, id] renvoyer
+//                                   [5] coucou (toutes les 20 s) · [6] au revoir (le téléphone quitte la salle)
+//
+// Pourquoi des « au revoir » à nous ? Chez Render, le portail devant le serveur garde pour lui
+// les vraies fermetures de WebSocket : sans ça, personne ne saurait qu'un joueur est parti.
 
 "use strict";
 const http = require("http");
 const crypto = require("crypto");
 
 const MAX_JOUEURS = 8;
+// Un téléphone qui ne donne plus signe de vie pendant 2 min 30 est considéré comme parti
+// (il envoie un coucou toutes les 20 s ; on laisse le temps d'aller sur WhatsApp envoyer le code).
+const SILENCE_MAX = Number(process.env.RELAIS_SILENCE || 150000);
 const salles = new Map(); // code -> { hote, joueurs: Map<id, client> }
 
 // ------------------------------------------------------------------ les salles
@@ -50,6 +58,8 @@ function ouvert(c, code, role) {
 }
 
 function recu(c, octets) {
+  if (octets.length === 0) return;
+  if (octets[0] === 6) return c.fermer();
   const s = salles.get(c.salle);
   if (!s || octets.length < 5) return;
   const pour = octets.readInt32LE(1);
@@ -100,16 +110,23 @@ function brancher(socket, code, role) {
   let morceaux = [];
   let ferme_deja = false;
   const c = {
-    envoyer(b) { if (!socket.destroyed) socket.write(trame(2, b)); },
+    vu: Date.now(),
+    envoyer(b) { if (!socket.destroyed && !socket.writableEnded) socket.write(trame(2, b)); },
     fermer() {
       if (ferme_deja) return;
       ferme_deja = true;
-      if (!socket.destroyed) { socket.write(trame(8, Buffer.alloc(0))); socket.end(); }
+      if (!socket.destroyed && !socket.writableEnded) {
+        socket.write(trame(2, Buffer.from([8])));
+        socket.write(trame(8, Buffer.alloc(0)));
+        socket.end();
+        setTimeout(() => socket.destroy(), 5000);
+      }
       ferme(c);
     },
   };
   socket.setNoDelay(true);
   socket.on("data", (morceau) => {
+    c.vu = Date.now();
     tampon = Buffer.concat([tampon, morceau]);
     for (;;) {
       if (tampon.length < 2) return;
@@ -146,7 +163,11 @@ function brancher(socket, code, role) {
 }
 
 const serveur = http.createServer((req, res) => {
-  res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+  res.writeHead(200, {
+    "content-type": "text/plain; charset=utf-8",
+    "cache-control": "no-store",
+    "access-control-allow-origin": "*",
+  });
   res.end(`L'Hôtel Garou : le relais marche ! (${salles.size} salle(s))`);
 });
 
@@ -159,10 +180,17 @@ serveur.on("upgrade", (req, socket) => {
   brancher(socket, url.searchParams.get("salle"), url.searchParams.get("role"));
 });
 
-// Un petit « ping » toutes les 25 s : les connexions restent ouvertes (et le serveur ne s'endort pas en pleine partie).
+// Un petit « coucou » toutes les 25 s : les connexions restent ouvertes (et le serveur ne s'endort pas en pleine partie).
+// Au passage, on fait partir les téléphones qui ne répondent plus depuis longtemps.
 setInterval(() => {
-  for (const s of salles.values()) for (const c of [s.hote, ...s.joueurs.values()]) c.envoyer(Buffer.from([7]));
-}, 25000);
+  const maintenant = Date.now();
+  for (const s of [...salles.values()]) {
+    for (const c of [s.hote, ...s.joueurs.values()]) {
+      if (maintenant - c.vu > SILENCE_MAX) c.fermer();
+      else c.envoyer(Buffer.from([7]));
+    }
+  }
+}, Number(process.env.RELAIS_TOUR || 25000));
 
 const port = Number(process.env.PORT || 10000);
 serveur.listen(port, () => console.log("Relais de L'Hôtel Garou prêt sur le port " + port));
